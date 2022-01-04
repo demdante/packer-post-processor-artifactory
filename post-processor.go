@@ -3,36 +3,37 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
-	"crypto/sha1"
-	"crypto/sha256"
-	"crypto/md5"
-	"io"
-	"bufio"
-	"encoding/hex"
+	"strings"
+
 	"github.com/hashicorp/hcl/v2/hcldec"
 	"github.com/hashicorp/packer/common"
 	"github.com/hashicorp/packer/helper/config"
 	"github.com/hashicorp/packer/packer"
 	"github.com/hashicorp/packer/template/interpolate"
-	"strings"
-	"bytes"
-	"errors"
-	"crypto/sha512"
-	"context"
 )
 
 type Config struct {
-	BoxName     string  `mapstructure:"box_name"`
-	BoxDir      string  `mapstructure:"box_dir"`
-	BoxProvider string  `mapstructure:"box_provider"`
-	Version     string  `mapstructure:"version"`
-	BlobURL     string  `mapstructure:"url"`
-	Repo        string  `mapstructure:"repo"`
-	AuthKey     string  `mapstructure:"key"`
+	BoxName             string `mapstructure:"box_name"`
+	BoxDir              string `mapstructure:"box_dir"`
+	Version             string `mapstructure:"version"`
+	Date                string `mapstructure:"date"`
+	BlobURL             string `mapstructure:"url"`
+	Repo                string `mapstructure:"repo"`
+	AuthKey             string `mapstructure:"key"`
 	common.PackerConfig `mapstructure:",squash"`
 
 	ctx interpolate.Context
@@ -84,17 +85,10 @@ func (p *PostProcessor) Configure(raws ...interface{}) error {
 }
 
 func (p *PostProcessor) PostProcess(ctx context.Context, ui packer.Ui, artifact packer.Artifact) (packer.Artifact, bool, bool, error) {
-	if artifact.BuilderId() != "mitchellh.virtualbox" {
-		return nil, false, false, fmt.Errorf("Unknown artifact type, requires box from vagrant post-processor: %s", artifact.BuilderId())
-
-	}
 	box := artifact.Files()[0]
-	if !strings.HasSuffix(box, ".box") {
+	if !strings.HasSuffix(box, ".ova") {
 		return nil, false, false, fmt.Errorf("Unknown files in artifact from vagrant post-processor: %s", artifact.Files())
 	}
-
-	provider := providerFromBuilderName(artifact.Id())
-	ui.Say(fmt.Sprintf("Preparing to upload box for '%s' provider to Artifactory repositories '%s'/'%s'", provider, p.config.BlobURL, p.config.Repo))
 
 	// determine box size
 	boxStat, err := os.Stat(box)
@@ -104,11 +98,10 @@ func (p *PostProcessor) PostProcess(ctx context.Context, ui packer.Ui, artifact 
 
 	// determine version
 	version := p.config.Version
-
-	ui.Message(fmt.Sprintf("Box to upload: %s (%d bytes) Version: %s", box, boxStat.Size(), version))
+	date := p.config.Date
+	ui.Message(fmt.Sprintf("Box to upload: %s (%d bytes) Version: %s  Date: %s", box, boxStat.Size(), version, date))
 
 	ui.Message("Generating checksums")
-
 
 	f, err := os.OpenFile(box, os.O_RDONLY, 0)
 	if err != nil {
@@ -149,7 +142,7 @@ func (p *PostProcessor) uploadBox(box string, ui packer.Ui, hashInfo HashInfo) e
 	if importRepo == "" {
 		importRepo = fmt.Sprintf("http://localhost:8080/'%s'/'%s'", repo, box)
 	} else {
-		importRepo = fmt.Sprintf("%s/%s/%s/%s-%s-%s.box"+";box_name=%s;box_provider=%s;box_version=%s", importRepo, repo, p.config.BoxDir, p.config.BoxName, p.config.BoxProvider, p.config.Version, p.config.BoxName, p.config.BoxProvider, p.config.Version)
+		importRepo = fmt.Sprintf("%s/%s/%s/%s.ova"+";version=%s;date=%s", importRepo, repo, p.config.BoxDir, p.config.BoxName, p.config.Version, p.config.Date)
 	}
 
 	ui.Message(importRepo)
@@ -160,13 +153,9 @@ func (p *PostProcessor) uploadBox(box string, ui packer.Ui, hashInfo HashInfo) e
 	defer file.Close()
 	resp, err := http.NewRequest("PUT", importRepo, file)
 	resp.Header.Set("X-JFrog-Art-Api", AuthKey)
-	resp.Header.Set("X-Checksum-Sha1", hashInfo.Sha1)
-	resp.Header.Set("X-Checksum-Sha256", hashInfo.Sha256)
-	resp.Header.Set("X-Checksum-Md5", hashInfo.Md5)
 	if err != nil {
 		log.Fatal(err)
 	}
-	resp.Header.Set("Content-Type", "text/plain")
 
 	client := &http.Client{}
 	res, err := client.Do(resp)
@@ -183,7 +172,7 @@ func (p *PostProcessor) uploadBox(box string, ui packer.Ui, hashInfo HashInfo) e
 	}
 	ui.Message(buffer.String())
 
-	if (res.StatusCode != 201) {
+	if res.StatusCode != 201 {
 		return errors.New("Error uploading File")
 	}
 	return err
